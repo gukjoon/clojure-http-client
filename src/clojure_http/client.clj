@@ -16,6 +16,8 @@
 (def *connect-timeout* 0)
 
 (def *buffer-size* 1024)
+;;(def *buffer-size* 262144)
+;;(def *buffer-size* 16777216)
 
 (defn set-system-proxy!
   "Java's HttpURLConnection cannot do per-request proxying. Instead,
@@ -78,6 +80,13 @@ or the error stream of connection, whichever is appropriate."
                          (.getErrorStream connection)
                          (.getInputStream connection))
                        (StringReader. ""))))
+
+(defn- body-stream
+  "Returns the input stream of the connection."
+  [#^HttpURLConnection connection]
+  (if (>= (.getResponseCode connection) 400)
+    (.getErrorStream connection)
+    (.getInputStream connection)))
 
 (defn- parse-headers
   "Returns a map of the response headers from connection."
@@ -149,6 +158,52 @@ by a server."
 
     (let [headers (parse-headers connection)]
       {:body-seq (body-seq connection)
+       :connection connection
+       :code (.getResponseCode connection)
+       :msg (.getResponseMessage connection)
+       :method method
+       :headers (dissoc headers :set-cookie)
+       ;; This correctly implements case-insensitive lookup.
+       :get-header #(.getHeaderField connection #^String (as-str %))
+       :cookies (apply merge (map parse-cookies (headers :set-cookie)))
+       :url (str (.getURL connection))})))
+
+
+(defn stream-request
+  "Perform an HTTP request on URL u. Uses InputStream for body instead of LazySeq. [JC 2010/07/01]"
+  [u & [method headers cookies body]]
+  ;; This function *should* throw an exception on non-HTTP URLs.
+  ;; This will happen if the cast fails.
+  (let [u (url u)
+        #^HttpURLConnection connection
+        (cast HttpURLConnection (.openConnection u))
+        method (.toUpperCase #^String (as-str (or method
+                                                  "GET")))]
+    (.setRequestMethod connection method)
+    (.setConnectTimeout connection *connect-timeout*)
+
+    (doseq [[header value] (conj default-headers (or headers {}))]
+      ;; Treat Cookie specially -- see below.
+      (when (not (= header "Cookie"))
+        (.setRequestProperty connection header value)))
+
+    (when (and cookies (not (empty? cookies)))
+      (.setRequestProperty connection
+                           "Cookie"
+                           (create-cookie-string cookies)))
+
+    (when (.getUserInfo u)
+      (.setRequestProperty connection
+                           "Authorization"
+                           (str "Basic "
+                                (base64/encode-str (.getUserInfo u)))))
+
+    (if body
+      (send-body body connection headers)
+      (.connect connection))
+
+    (let [headers (parse-headers connection)]
+      {:body-stream (body-stream connection)
        :connection connection
        :code (.getResponseCode connection)
        :msg (.getResponseMessage connection)
